@@ -13,12 +13,16 @@ from unittest.mock import patch
 import pytest
 
 from voice_comms_chip.spark_hook import (
+    _build_speak_coherence,
+    _join_url,
+    _write_output,
     handle_voice_install_hook,
     handle_voice_onboard_hook,
     handle_voice_plan_hook,
     handle_voice_speak_hook,
     handle_voice_status_hook,
     handle_voice_transcribe_hook,
+    _read_env_map,
     main,
 )
 
@@ -56,6 +60,31 @@ def _payload(tmp_path, **overrides):
     }
     payload.update(overrides)
     return payload
+
+
+def test_read_env_map_strips_matching_outer_quotes(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                'DOUBLE_QUOTED="double-value"',
+                "SINGLE_QUOTED='single-value'",
+                "UNQUOTED=plain-value",
+                'UNMATCHED="keep-leading-quote',
+                'INNER_QUOTES=prefix"inner"suffix',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert _read_env_map(env_file_path=str(env_file)) == {
+        "DOUBLE_QUOTED": "double-value",
+        "SINGLE_QUOTED": "single-value",
+        "UNQUOTED": "plain-value",
+        "UNMATCHED": '"keep-leading-quote',
+        "INNER_QUOTES": 'prefix"inner"suffix',
+    }
 
 
 def test_voice_status_default_requires_local_faster_whisper(tmp_path):
@@ -294,10 +323,10 @@ def test_voice_install_kokoro_runs_local_pip_when_missing():
         assert check is False
         return SimpleNamespace(returncode=0, stdout="installed ok\n", stderr="")
 
-    with patch("voice_comms_chip.spark_hook._local_kokoro_package_available", side_effect=[False, True, True]), patch(
-        "voice_comms_chip.spark_hook.subprocess.run",
-        side_effect=fake_run,
-    ):
+    with patch("voice_comms_chip.spark_hook._kokoro_python_unsupported_message", return_value=None), patch(
+        "voice_comms_chip.spark_hook._local_kokoro_package_available",
+        side_effect=[False, True, True],
+    ), patch("voice_comms_chip.spark_hook.subprocess.run", side_effect=fake_run):
         result = handle_voice_install_hook({"target": "kokoro"})
 
     assert result["returncode"] == 0
@@ -314,7 +343,10 @@ def test_voice_install_kokoro_runs_local_pip_when_missing():
 
 
 def test_voice_install_kokoro_skips_pip_when_already_installed():
-    with patch("voice_comms_chip.spark_hook._local_kokoro_package_available", return_value=True), patch(
+    with patch("voice_comms_chip.spark_hook._kokoro_python_unsupported_message", return_value=None), patch(
+        "voice_comms_chip.spark_hook._local_kokoro_package_available",
+        return_value=True,
+    ), patch(
         "voice_comms_chip.spark_hook.subprocess.run",
     ) as run:
         result = handle_voice_install_hook({"target": "kokoro"})
@@ -339,7 +371,10 @@ def test_voice_install_kokoro_sees_model_assets_from_process_env(tmp_path):
             "VOICE_TTS_KOKORO_VOICES_PATH": str(voices_path),
         },
         clear=False,
-    ), patch("voice_comms_chip.spark_hook._local_kokoro_package_available", return_value=True), patch(
+    ), patch("voice_comms_chip.spark_hook._kokoro_python_unsupported_message", return_value=None), patch(
+        "voice_comms_chip.spark_hook._local_kokoro_package_available",
+        return_value=True,
+    ), patch(
         "voice_comms_chip.spark_hook.subprocess.run",
     ) as run:
         result = handle_voice_install_hook({"target": "kokoro"})
@@ -378,6 +413,33 @@ def test_voice_install_faster_whisper_runs_local_pip_when_missing():
     assert "send one short Telegram voice note" in result["result"]["reply_text"]
 
 
+def test_voice_install_kokoro_reports_unsupported_python_runtime():
+    message = "kokoro-onnx failed from /tmp/private-runtime with sk-live-secret and traceback detail."
+
+    with patch("voice_comms_chip.spark_hook._kokoro_python_unsupported_message", return_value=message), patch(
+        "voice_comms_chip.spark_hook.subprocess.run",
+    ) as run:
+        result = handle_voice_install_hook({"target": "kokoro"})
+
+    encoded = json.dumps(result)
+    assert result["returncode"] == 1
+    assert result["stdout"] == ""
+    assert result["stderr"] == "Kokoro install is not supported in this Python runtime."
+    assert result["error"] == result["stderr"]
+    assert result["error_code"] == "voice_install_unsupported_runtime"
+    assert result["metrics"]["installed"] == 0
+    assert result["result"]["error_code"] == "voice_install_unsupported_runtime"
+    assert result["result"]["installed"] is False
+    assert result["result"]["kokoro_ready"] is False
+    assert "cannot run in this Python runtime" in result["result"]["reply_text"]
+    assert "Python 3.10-3.13" in result["result"]["reply_text"]
+    assert message not in encoded
+    assert "/tmp/private-runtime" not in encoded
+    assert "sk-live-secret" not in encoded
+    assert "traceback" not in encoded.lower()
+    run.assert_not_called()
+
+
 def test_voice_install_local_stack_installs_stt_and_kokoro_packages():
     calls: list[list[str]] = []
 
@@ -385,7 +447,10 @@ def test_voice_install_local_stack_installs_stt_and_kokoro_packages():
         calls.append(command)
         return SimpleNamespace(returncode=0, stdout="installed ok\n", stderr="")
 
-    with patch("voice_comms_chip.spark_hook._local_faster_whisper_available", side_effect=[False, True]), patch(
+    with patch("voice_comms_chip.spark_hook._kokoro_python_unsupported_message", return_value=None), patch(
+        "voice_comms_chip.spark_hook._local_faster_whisper_available",
+        side_effect=[False, True],
+    ), patch(
         "voice_comms_chip.spark_hook._local_kokoro_package_available",
         side_effect=[False, True, True],
     ), patch("voice_comms_chip.spark_hook._local_kokoro_ready", return_value=False), patch(
@@ -472,6 +537,100 @@ def test_cli_main_accepts_utf8_sig_payload(tmp_path):
     assert payload["result"]["recommended_path"] == "local_free"
 
 
+def test_cli_main_writes_structured_error_for_invalid_json(tmp_path):
+    input_path = tmp_path / "input.json"
+    output_path = tmp_path / "output.json"
+    hostile_payload = "{bad json with /tmp/private-builder.env and sk-live-secret"
+    input_path.write_text(hostile_payload, encoding="utf-8")
+
+    with patch.object(
+        sys,
+        "argv",
+        [
+            "spark_hook",
+            "voice.status",
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+        ],
+    ):
+        exit_code = main()
+
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    encoded = json.dumps(payload)
+    assert exit_code == 1
+    assert payload["returncode"] == 1
+    assert payload["error_code"] == "voice_hook_invalid_json"
+    assert payload["error"] == "Voice hook input must be valid JSON."
+    assert payload["stderr"] == payload["error"]
+    assert payload["result"] == {}
+    assert hostile_payload not in encoded
+    assert "/tmp/private-builder.env" not in encoded
+    assert "sk-live-secret" not in encoded
+
+
+def test_cli_main_rejects_non_object_payload_before_hook_execution(tmp_path):
+    input_path = tmp_path / "input.json"
+    output_path = tmp_path / "output.json"
+    input_path.write_text("[]", encoding="utf-8")
+
+    with patch.object(
+        sys,
+        "argv",
+        [
+            "spark_hook",
+            "voice.status",
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+        ],
+    ), patch(
+        "voice_comms_chip.spark_hook.handle_voice_status_hook",
+        side_effect=AssertionError("non-object input should not execute hook logic"),
+    ):
+        exit_code = main()
+
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert payload["returncode"] == 1
+    assert payload["error_code"] == "voice_hook_input_not_object"
+    assert payload["error"] == "Voice hook input must be a JSON object."
+    assert payload["stderr"] == payload["error"]
+    assert payload["result"] == {}
+
+
+def test_cli_main_rejects_oversized_hook_input_before_execution(tmp_path):
+    input_path = tmp_path / "input.json"
+    output_path = tmp_path / "output.json"
+    input_path.write_text('{"padding":"xxxxxxxx"}', encoding="utf-8")
+
+    with patch.object(
+        sys,
+        "argv",
+        [
+            "spark_hook",
+            "voice.status",
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+        ],
+    ), patch("voice_comms_chip.spark_hook.MAX_HOOK_INPUT_BYTES", 8), patch(
+        "voice_comms_chip.spark_hook.handle_voice_status_hook",
+        side_effect=AssertionError("oversized input should not execute hook logic"),
+    ):
+        exit_code = main()
+
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert payload["returncode"] == 1
+    assert payload["error_code"] == "voice_hook_input_too_large"
+    assert payload["error"] == "Voice hook input is too large."
+    assert payload["result"] == {}
+
+
 def test_cli_main_exports_sanitized_runtime_state(tmp_path):
     input_path = tmp_path / "input.json"
     output_path = tmp_path / "output.json"
@@ -507,6 +666,28 @@ def test_cli_main_exports_sanitized_runtime_state(tmp_path):
     assert "transcript_text" not in encoded
     assert "audio_base64" not in encoded
     assert FAKE_OPENAI_KEY not in encoded
+
+
+def test_join_url_accepts_http_urls_and_trims_edges():
+    assert _join_url(" https://voice.example.test/api/ ", " /v1/speak ") == "https://voice.example.test/api/v1/speak"
+
+
+def test_join_url_rejects_non_http_provider_urls_without_echoing_value():
+    unsafe = "file:///tmp/private-token-path"
+
+    with pytest.raises(ValueError) as exc_info:
+        _join_url(unsafe, "voices")
+
+    message = str(exc_info.value)
+    assert "http or https" in message
+    assert unsafe not in message
+    assert "private-token-path" not in message
+
+
+@pytest.mark.parametrize("base_url", ["", "example.test/api", "mailto:voice@example.test", "https:///missing-host"])
+def test_join_url_requires_http_url_with_host(base_url):
+    with pytest.raises(ValueError, match="http or https URL with a host|non-empty string"):
+        _join_url(base_url, "voices")
 
 
 def test_voice_transcribe_posts_openai_compatible_multipart_request(tmp_path):
@@ -571,6 +752,117 @@ def test_voice_transcribe_auto_requires_local_faster_whisper_when_local_is_unava
     ):
         with pytest.raises(ValueError, match="Local faster-whisper transcription is the default"):
             handle_voice_transcribe_hook(payload)
+
+
+def test_voice_transcribe_rejects_malformed_audio_base64_before_provider_checks(tmp_path):
+    raw_payload = "!!!!/tmp/private-audio.ogg/sk-live-secret"
+    payload = _payload(
+        tmp_path,
+        audio_base64=raw_payload,
+        filename="telegram-voice.ogg",
+        mime_type="audio/ogg",
+    )
+
+    with patch(
+        "voice_comms_chip.spark_hook._local_faster_whisper_available",
+        side_effect=AssertionError("audio validation should run before provider readiness checks"),
+    ):
+        with pytest.raises(ValueError, match="audio_base64 must be valid base64"):
+            handle_voice_transcribe_hook(payload)
+
+
+def test_cli_main_returns_bounded_error_for_malformed_audio_base64(tmp_path):
+    input_path = tmp_path / "input.json"
+    output_path = tmp_path / "output.json"
+    raw_payload = "!!!!/tmp/private-audio.ogg/sk-live-secret"
+    input_path.write_text(
+        json.dumps({"audio_base64": raw_payload, "filename": "telegram-voice.ogg", "mime_type": "audio/ogg"}),
+        encoding="utf-8",
+    )
+
+    with patch.object(
+        sys,
+        "argv",
+        [
+            "spark_hook",
+            "voice.transcribe",
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+        ],
+    ), patch(
+        "voice_comms_chip.spark_hook._local_faster_whisper_available",
+        side_effect=AssertionError("audio validation should run before provider readiness checks"),
+    ):
+        exit_code = main()
+
+    result = json.loads(output_path.read_text(encoding="utf-8"))
+    encoded = json.dumps(result)
+    assert exit_code == 1
+    assert result["returncode"] == 1
+    assert result["error_code"] == "voice_transcribe_audio_invalid_base64"
+    assert result["error"] == "voice.transcribe audio_base64 must be valid base64 audio bytes."
+    assert result["stderr"] == result["error"]
+    assert result["stdout"] == ""
+    assert result["result"] == {}
+    assert raw_payload not in encoded
+    assert "/tmp/private-audio.ogg" not in encoded
+    assert "sk-live-secret" not in encoded
+
+
+def test_voice_transcribe_rejects_oversized_audio_before_provider_checks(tmp_path):
+    payload = _payload(
+        tmp_path,
+        audio_base64=base64.b64encode(b"fake-ogg-bytes").decode("ascii"),
+        filename="telegram-voice.ogg",
+        mime_type="audio/ogg",
+    )
+
+    with patch("voice_comms_chip.spark_hook.MAX_TRANSCRIBE_AUDIO_BYTES", 4), patch(
+        "voice_comms_chip.spark_hook._local_faster_whisper_available",
+        side_effect=AssertionError("audio validation should run before provider readiness checks"),
+    ):
+        with pytest.raises(ValueError, match="too large"):
+            handle_voice_transcribe_hook(payload)
+
+
+def test_cli_main_returns_bounded_error_for_oversized_audio(tmp_path):
+    input_path = tmp_path / "input.json"
+    output_path = tmp_path / "output.json"
+    audio_base64 = base64.b64encode(b"fake-ogg-bytes").decode("ascii")
+    input_path.write_text(
+        json.dumps({"audio_base64": audio_base64, "filename": "telegram-voice.ogg", "mime_type": "audio/ogg"}),
+        encoding="utf-8",
+    )
+
+    with patch.object(
+        sys,
+        "argv",
+        [
+            "spark_hook",
+            "voice.transcribe",
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+        ],
+    ), patch("voice_comms_chip.spark_hook.MAX_TRANSCRIBE_AUDIO_BYTES", 4), patch(
+        "voice_comms_chip.spark_hook._local_faster_whisper_available",
+        side_effect=AssertionError("audio validation should run before provider readiness checks"),
+    ):
+        exit_code = main()
+
+    result = json.loads(output_path.read_text(encoding="utf-8"))
+    encoded = json.dumps(result)
+    assert exit_code == 1
+    assert result["returncode"] == 1
+    assert result["error_code"] == "voice_transcribe_audio_too_large"
+    assert result["error"] == "voice.transcribe audio_base64 is too large."
+    assert result["stderr"] == result["error"]
+    assert result["stdout"] == ""
+    assert result["result"] == {}
+    assert audio_base64 not in encoded
 
 
 
@@ -857,6 +1149,25 @@ def test_voice_speak_uses_telegram_compatible_opus_for_telegram_surface(tmp_path
     assert captured["body"]["text"] == "Telegram voice note reply."
 
 
+def test_voice_speak_coherence_fails_on_exact_caption_mismatch():
+    result = _build_speak_coherence(
+        request={"text": "Approved spoken answer."},
+        payload={"caption_text": "Different caption.", "coherence_mode": "exact"},
+    )
+
+    assert result["check"] == "failed"
+    assert result["caption_matches_spoken"] is False
+
+
+def test_write_output_replaces_temp_file(tmp_path):
+    output_path = tmp_path / "voice-output.json"
+
+    _write_output(output_path, {"ok": True})
+
+    assert output_path.read_text(encoding="utf-8") == '{\n  "ok": true\n}'
+    assert not (tmp_path / "voice-output.json.tmp").exists()
+
+
 def test_voice_speak_supports_local_pyttsx3_tts(tmp_path):
     captured: dict[str, object] = {}
 
@@ -1075,6 +1386,57 @@ def test_voice_speak_supports_openai_gpt_realtime_2(tmp_path):
     assert sent_messages[1]["type"] == "response.create"
     assert sent_messages[1]["response"]["instructions"] == sent_messages[0]["session"]["instructions"]
     assert sent_messages[1]["response"]["input"][0]["content"][0]["text"] == "Use the new realtime voice."
+
+
+def test_voice_speak_reports_malformed_openai_realtime_websocket_message(tmp_path):
+    sent_messages: list[dict[str, object]] = []
+    raw_payload = '{"type":"response.output_audio.delta","delta":"secret-token'
+
+    class FakeRealtimeSocket:
+        def send(self, message: str) -> None:
+            sent_messages.append(json.loads(message))
+
+        def recv(self) -> str:
+            return raw_payload
+
+        def close(self) -> None:
+            return None
+
+    def fake_create_connection(url: str, *, header: list[str], timeout: float):
+        return FakeRealtimeSocket()
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                f"OPENAI_API_KEY={FAKE_OPENAI_KEY}",
+                "VOICE_TTS_PROVIDER=openai-realtime",
+                "VOICE_TTS_OPENAI_REALTIME_MODEL_ID=gpt-realtime-2",
+                "VOICE_TTS_OPENAI_REALTIME_VOICE=coral",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with patch.dict(
+        sys.modules,
+        {"websocket": SimpleNamespace(create_connection=fake_create_connection)},
+    ):
+        with pytest.raises(RuntimeError) as exc_info:
+            handle_voice_speak_hook(
+                {
+                    "builder_env_file_path": str(env_file),
+                    "surface": "telegram",
+                    "text": "Use the new realtime voice.",
+                }
+            )
+
+    message = str(exc_info.value)
+    assert "OpenAI Realtime TTS received malformed websocket message" in message
+    assert "secret-token" not in message
+    assert sent_messages[0]["type"] == "session.update"
+    assert sent_messages[1]["type"] == "response.create"
 
 
 def test_voice_speak_retries_with_fallback_voice_when_primary_voice_is_missing(tmp_path):
