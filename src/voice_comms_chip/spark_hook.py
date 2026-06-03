@@ -2305,8 +2305,8 @@ def _public_runtime_state(runtime_state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _export_runtime_state_if_configured(result: dict[str, Any]) -> None:
-    path_text = str(os.environ.get(ENV_RUNTIME_STATE_PATH) or "").strip()
+def _export_runtime_state_if_configured(result: dict[str, Any], *, state_file: str | None = None) -> None:
+    path_text = (state_file or str(os.environ.get(ENV_RUNTIME_STATE_PATH) or "")).strip()
     if not path_text:
         return
     result_payload = result.get("result") if isinstance(result.get("result"), dict) else {}
@@ -2324,6 +2324,7 @@ def main() -> int:
     )
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--state-file", default=None, help="Override path for runtime state export")
     args = parser.parse_args()
 
     try:
@@ -2344,7 +2345,7 @@ def main() -> int:
         _write_output(Path(args.output), _hook_error_payload(exc))
         return 1
 
-    _export_runtime_state_if_configured(result)
+    _export_runtime_state_if_configured(result, state_file=args.state_file)
     _write_output(Path(args.output), result)
     return 0
 
