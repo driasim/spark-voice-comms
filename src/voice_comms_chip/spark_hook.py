@@ -2320,11 +2320,19 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "hook",
+        nargs="?",
         choices=["voice.status", "voice.plan", "voice.onboard", "voice.install", "voice.transcribe", "voice.speak"],
     )
-    parser.add_argument("--input", required=True)
-    parser.add_argument("--output", required=True)
+    parser.add_argument("--input", required="--input" in sys.argv)
+    parser.add_argument("--output", required="--output" in sys.argv)
+    parser.add_argument("--version", action="store_true", help="Show version and exit")
     args = parser.parse_args()
+
+    if args.version:
+        from voice_comms_chip import __version__
+
+        print(f"spark-voice-comms {__version__}")
+        return 0
 
     try:
         payload = _load_hook_payload(Path(args.input), hook=args.hook)
